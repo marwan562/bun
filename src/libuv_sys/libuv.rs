@@ -18,7 +18,9 @@
 use core::cell::{Cell, UnsafeCell};
 use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort, c_void};
 use core::mem::MaybeUninit;
+use core::time::Duration;
 use core::{fmt, mem, ptr};
+use std::time::Instant;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Debug log scope (`bun.Output.scoped(.uv, .hidden)`). This crate is leaf
@@ -461,6 +463,13 @@ impl Loop {
     /// pre/check/async/timer, closed by us_loop_free and freed by their close
     /// callbacks when the loop next turns.
     pub fn close_thread_loop() {
+        /// How long `close_thread_loop` waits for the close completions of
+        /// handles it found still linked. A few hundred cancelled AFD polls
+        /// complete within milliseconds, but the kernel completes them
+        /// slower the more are outstanding at once: a worker torn down with
+        /// 9000 open sockets needed 17s. This bound is a safety valve for a
+        /// handle whose I/O never returns, not a budget.
+        const CLOSE_THREAD_LOOP_DEADLINE: Duration = Duration::from_secs(60);
         THREADLOCAL_LOOP.with(|slot| {
             let loop_ = slot.get();
             if loop_.is_null() {
@@ -484,15 +493,27 @@ impl Loop {
                     // RunMode::Default would also wait on ref'd-but-idle state
                     // (Bun's virtual keep-alive count lives in active_handles) and
                     // never return.
-                    let mut rc = ReturnCode::ZERO;
-                    for _ in 0..64 {
+                    //
+                    // A closing uv_poll_t (every uSockets socket) reaches its
+                    // endgame only once the kernel completes the AFD poll that
+                    // uv_close cancelled. That completion is posted to the IOCP
+                    // asynchronously, and one turn dequeues at most 128 of them
+                    // (uv__poll's GetQueuedCompletionStatusEx batch), so a fixed
+                    // number of back-to-back NoWait turns is wrong both ways: they
+                    // finish in microseconds, before the first completion lands,
+                    // and they cap how many sockets can close at all. Keep
+                    // turning, yield between turns, bounded by a deadline.
+                    let deadline = Instant::now() + CLOSE_THREAD_LOOP_DEADLINE;
+                    let mut rc;
+                    loop {
                         // SAFETY: this thread's initialised loop; nothing else drives it.
                         let _ = unsafe { uv_run(loop_, RunMode::NoWait) };
                         // SAFETY: as above.
                         rc = unsafe { uv_loop_close(loop_) };
-                        if rc == ReturnCode::ZERO {
+                        if rc == ReturnCode::ZERO || Instant::now() >= deadline {
                             break;
                         }
+                        std::thread::sleep(Duration::from_millis(1));
                     }
                     debug_assert_eq!(
                         rc,
